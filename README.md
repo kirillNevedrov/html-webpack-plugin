@@ -85,6 +85,7 @@ Allowed values are as follows:
 - `chunks`: Allows you to add only some chunks (e.g. only the unit-test chunk)
 - `chunksSortMode`: Allows to control how chunks should be sorted before they are included to the html. Allowed values: 'none' | 'auto' | 'dependency' | {function} - default: 'auto'
 - `excludeChunks`: Allows you to skip some chunks (e.g. don't add the unit-test chunk)
+- `skipRecompiles`: `false | true` Allows the plugin to skip doing work during recompiles. This is useful during development to speed up recompile times. Note: Only use this if all output assets have the same name, the template is unchanged during runtime, and don't mind new assets added directly to the template missing after addition. The `cache` option will make sure to skip a lot of work if that's needed, so this option should not be enabled in those cases.
 - `xhtml`: `true | false` If `true` render the `link` tags as self-closing, XHTML compliant. Default is `false`
 
 Here's an example webpack config illustrating how to use these options:
