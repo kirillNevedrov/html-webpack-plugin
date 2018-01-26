@@ -66,9 +66,11 @@ HtmlWebpackPlugin.prototype.apply = function (compiler) {
 
   compiler.plugin('emit', function (compilation, callback) {
     if (self.options.skipRecompiles && self.compiled) return callback();
-    var applyPluginsAsyncWaterfall = Promise.promisify(compilation.applyPluginsAsyncWaterfall, {context: compilation});
+    var applyPluginsAsyncWaterfall = self.applyPluginsAsyncWaterfall(compilation);
     // Get all chunks
-    var chunks = self.filterChunks(compilation.getStats().toJson(), self.options.chunks, self.options.excludeChunks);
+    var allChunks = compilation.getStats().toJson().chunks;
+    // Filter chunks (options.chunks and options.excludeCHunks)
+    var chunks = self.filterChunks(allChunks, self.options.chunks, self.options.excludeChunks);
     // Sort chunks
     chunks = self.sortChunks(chunks, self.options.chunksSortMode);
     // Let plugins alter the chunks and the chunk sorting
@@ -120,7 +122,7 @@ HtmlWebpackPlugin.prototype.apply = function (compiler) {
       // Allow plugins to make changes to the assets before invoking the template
       // This only makes sense to use if `inject` is `false`
       .then(function (compilationResult) {
-        return applyPluginsAsyncWaterfall('html-webpack-plugin-before-html-generation', {
+        return applyPluginsAsyncWaterfall('html-webpack-plugin-before-html-generation', false, {
           assets: assets,
           outputName: self.childCompilationOutputName,
           plugin: self
@@ -140,28 +142,32 @@ HtmlWebpackPlugin.prototype.apply = function (compiler) {
       // Allow plugins to change the html before assets are injected
       .then(function (html) {
         var pluginArgs = {html: html, assets: assets, plugin: self, outputName: self.childCompilationOutputName};
-        return applyPluginsAsyncWaterfall('html-webpack-plugin-before-html-processing', pluginArgs)
-          .then(function () {
-            return pluginArgs.html;
-          });
+        return applyPluginsAsyncWaterfall('html-webpack-plugin-before-html-processing', true, pluginArgs);
       })
-      .then(function (html) {
+      .then(function (result) {
+        var html = result.html;
+        var assets = result.assets;
         // Prepare script and link tags
         var assetTags = self.generateAssetTags(assets);
         var pluginArgs = {head: assetTags.head, body: assetTags.body, plugin: self, chunks: chunks, outputName: self.childCompilationOutputName};
         // Allow plugins to change the assetTag definitions
-        return applyPluginsAsyncWaterfall('html-webpack-plugin-alter-asset-tags', pluginArgs)
-          .then(function () {
+        return applyPluginsAsyncWaterfall('html-webpack-plugin-alter-asset-tags', true, pluginArgs)
+          .then(function (result) {
               // Add the stylesheets, scripts and so on to the resulting html
-            return self.postProcessHtml(html, assets, { body: pluginArgs.body, head: pluginArgs.head });
+            return self.postProcessHtml(html, assets, { body: result.body, head: result.head })
+              .then(function (html) {
+                return _.extend(result, {html: html, assets: assets});
+          });
           });
       })
       // Allow plugins to change the html after assets are injected
-      .then(function (html) {
+      .then(function (result) {
+        var html = result.html;
+        var assets = result.assets;
         var pluginArgs = {html: html, assets: assets, plugin: self, outputName: self.childCompilationOutputName};
-        return applyPluginsAsyncWaterfall('html-webpack-plugin-after-html-processing', pluginArgs)
-          .then(function () {
-            return pluginArgs.html;
+        return applyPluginsAsyncWaterfall('html-webpack-plugin-after-html-processing', true, pluginArgs)
+          .then(function (result) {
+            return result.html;
           });
       })
       .catch(function (err) {
@@ -185,7 +191,7 @@ HtmlWebpackPlugin.prototype.apply = function (compiler) {
       })
       .then(function () {
         // Let other plugins know that we are done:
-        return applyPluginsAsyncWaterfall('html-webpack-plugin-after-emit', {
+        return applyPluginsAsyncWaterfall('html-webpack-plugin-after-emit', false, {
           html: compilation.assets[self.childCompilationOutputName],
           outputName: self.childCompilationOutputName,
           plugin: self
@@ -198,7 +204,7 @@ HtmlWebpackPlugin.prototype.apply = function (compiler) {
       })
       // Let webpack continue with it
       .finally(function () {
-      self.compiled = true;
+        self.compiled = true;
         callback();
         // Tell blue bird that we don't want to wait for callback.
         // Fixes "Warning: a promise was created in a handler but none were returned from it"
@@ -229,6 +235,9 @@ HtmlWebpackPlugin.prototype.evaluateCompilationResult = function (compilation, s
     newSource = vmScript.runInContext(vmContext);
   } catch (e) {
     return Promise.reject(e);
+  }
+  if (typeof newSource === 'object' && newSource.__esModule && newSource.default) {
+    newSource = newSource.default;
   }
   return typeof newSource === 'string' || typeof newSource === 'function'
     ? Promise.resolve(newSource)
@@ -339,7 +348,7 @@ HtmlWebpackPlugin.prototype.sortChunks = function (chunks, sortMode) {
   }
   // Check if the given sort mode is a valid chunkSorter sort mode
   if (typeof chunkSorter[sortMode] !== 'undefined') {
-    return chunkSorter[sortMode](chunks);
+    return chunkSorter[sortMode](chunks, this.options.chunks);
   }
   throw new Error('"' + sortMode + '" is not a valid chunk sort mode');
 };
@@ -347,15 +356,19 @@ HtmlWebpackPlugin.prototype.sortChunks = function (chunks, sortMode) {
 /**
  * Return all chunks from the compilation result which match the exclude and include filters
  */
-HtmlWebpackPlugin.prototype.filterChunks = function (webpackStatsJson, includedChunks, excludedChunks) {
-  return webpackStatsJson.chunks.filter(function (chunk) {
+HtmlWebpackPlugin.prototype.filterChunks = function (chunks, includedChunks, excludedChunks) {
+  return chunks.filter(function (chunk) {
     var chunkName = chunk.names[0];
     // This chunk doesn't have a name. This script can't handled it.
     if (chunkName === undefined) {
       return false;
     }
     // Skip if the chunk should be lazy loaded
-    if (!chunk.initial) {
+    if (typeof chunk.isInitial === 'function') {
+      if (!chunk.isInitial()) {
+      return false;
+    }
+    } else if (!chunk.initial) {
       return false;
     }
     // Skip if the chunks should be filtered and the given chunk was not added explicity
@@ -379,12 +392,12 @@ HtmlWebpackPlugin.prototype.isHotUpdateCompilation = function (assets) {
 
 HtmlWebpackPlugin.prototype.htmlWebpackPluginAssets = function (compilation, chunks) {
   var self = this;
-  var webpackStatsJson = compilation.getStats().toJson();
+  var compilationHash = compilation.hash;
 
   // Use the configured public path or build a relative path
   var publicPath = typeof compilation.options.output.publicPath !== 'undefined'
     // If a hard coded public path exists use it
-    ? compilation.mainTemplate.getPublicPath({hash: webpackStatsJson.hash})
+    ? compilation.mainTemplate.getPublicPath({hash: compilationHash})
     // If no public path was set get a relative url path
     : path.relative(path.resolve(compilation.options.output.path, path.dirname(self.childCompilationOutputName)), compilation.options.output.path)
       .split(path.sep).join('/');
@@ -410,8 +423,8 @@ HtmlWebpackPlugin.prototype.htmlWebpackPluginAssets = function (compilation, chu
 
   // Append a hash for cache busting
   if (this.options.hash) {
-    assets.manifest = self.appendHash(assets.manifest, webpackStatsJson.hash);
-    assets.favicon = self.appendHash(assets.favicon, webpackStatsJson.hash);
+    assets.manifest = self.appendHash(assets.manifest, compilationHash);
+    assets.favicon = self.appendHash(assets.favicon, compilationHash);
   }
 
   for (var i = 0; i < chunks.length; i++) {
@@ -428,7 +441,7 @@ HtmlWebpackPlugin.prototype.htmlWebpackPluginAssets = function (compilation, chu
     // Append a hash for cache busting
     if (this.options.hash) {
       chunkFiles = chunkFiles.map(function (chunkFile) {
-        return self.appendHash(chunkFile, webpackStatsJson.hash);
+        return self.appendHash(chunkFile, compilationHash);
       });
     }
 
@@ -516,8 +529,8 @@ HtmlWebpackPlugin.prototype.generateAssetTags = function (assets) {
  */
 HtmlWebpackPlugin.prototype.injectAssetsIntoHtml = function (html, assets, assetTags) {
   var htmlRegExp = /(<html[^>]*>)/i;
-  var headRegExp = /(<\/head>)/i;
-  var bodyRegExp = /(<\/body>)/i;
+  var headRegExp = /(<\/head\s*>)/i;
+  var bodyRegExp = /(<\/body\s*>)/i;
   var body = assetTags.body.map(this.createHtmlTag);
   var head = assetTags.head.map(this.createHtmlTag);
 
@@ -578,12 +591,22 @@ HtmlWebpackPlugin.prototype.appendHash = function (url, hash) {
  * Turn a tag definition into a html string
  */
 HtmlWebpackPlugin.prototype.createHtmlTag = function (tagDefinition) {
-  var attributes = Object.keys(tagDefinition.attributes || {}).map(function (attributeName) {
+  var attributes = Object.keys(tagDefinition.attributes || {})
+    .filter(function (attributeName) {
+      return tagDefinition.attributes[attributeName] !== false;
+    })
+    .map(function (attributeName) {
+      if (tagDefinition.attributes[attributeName] === true) {
+        return attributeName;
+      }
     return attributeName + '="' + tagDefinition.attributes[attributeName] + '"';
   });
-  return '<' + [tagDefinition.tagName].concat(attributes).join(' ') + (tagDefinition.selfClosingTag ? '/' : '') + '>' +
+  // Backport of 3.x void tag definition
+  var voidTag = tagDefinition.voidTag !== undefined ? tagDefinition.voidTag : !tagDefinition.closeTag;
+  var selfClosingTag = tagDefinition.voidTag !== undefined ? tagDefinition.voidTag && this.options.xhtml : tagDefinition.selfClosingTag;
+  return '<' + [tagDefinition.tagName].concat(attributes).join(' ') + (selfClosingTag ? '/' : '') + '>' +
     (tagDefinition.innerHTML || '') +
-    (tagDefinition.closeTag ? '</' + tagDefinition.tagName + '>' : '');
+    (voidTag ? '' : '</' + tagDefinition.tagName + '>');
 };
 
 /**
@@ -596,7 +619,7 @@ HtmlWebpackPlugin.prototype.getFullTemplatePath = function (template, context) {
   }
   // Resolve template path
   return template.replace(
-    /([!])([^\/\\][^!\?]+|[^\/\\!?])($|\?.+$)/,
+    /([!])([^/\\][^!?]+|[^/\\!?])($|\?[^!?\n]+$)/,
     function (match, prefix, filepath, postfix) {
       return prefix + path.resolve(filepath) + postfix;
     });
@@ -614,6 +637,23 @@ HtmlWebpackPlugin.prototype.getAssetFiles = function (assets) {
   }, []));
   files.sort();
   return files;
+};
+
+/**
+ * Helper to promisify compilation.applyPluginsAsyncWaterfall that returns
+ * a function that helps to merge given plugin arguments with processed ones
+ */
+HtmlWebpackPlugin.prototype.applyPluginsAsyncWaterfall = function (compilation) {
+  var promisedApplyPluginsAsyncWaterfall = Promise.promisify(compilation.applyPluginsAsyncWaterfall, {context: compilation});
+  return function (eventName, requiresResult, pluginArgs) {
+    return promisedApplyPluginsAsyncWaterfall(eventName, pluginArgs)
+      .then(function (result) {
+        if (requiresResult && !result) {
+          compilation.warnings.push(new Error('Using ' + eventName + ' without returning a result is deprecated.'));
+        }
+        return _.extend(pluginArgs, result);
+      });
+  };
 };
 
 module.exports = HtmlWebpackPlugin;
